@@ -888,6 +888,9 @@ static struct {
 	{ "5", RAID5 },
     { "raid6", RAID6 },
     { "6", RAID6 },
+    { "raidx", RAID7 },
+    { "raid7", RAID7 },
+    { "7", RAID7 },
 	{ }
 };
 

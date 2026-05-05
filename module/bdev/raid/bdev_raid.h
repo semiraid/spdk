@@ -43,6 +43,7 @@ enum raid_level {
 	RAID0			= 0,
 	RAID5			= 5,
     RAID6           = 6,
+    RAID7           = 7,
 };
 
 /*
