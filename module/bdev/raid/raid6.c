@@ -2566,6 +2566,8 @@ raid6_submit_rw_request(struct raid_bdev_io *raid_io)
     uint64_t num_blocks = bdev_io->u.bdev.num_blocks;
     uint64_t stripe_index = offset_blocks / r6info->stripe_blocks;
     uint64_t stripe_offset = offset_blocks % r6info->stripe_blocks;
+    uint64_t blocks_remaining = num_blocks;
+    uint64_t iov_offset = 0;
     struct stripe *stripe;
 
     //comment out this block
@@ -2575,20 +2577,35 @@ raid6_submit_rw_request(struct raid_bdev_io *raid_io)
 //        return;
 //    }
 
-    stripe = raid6_get_stripe(r6info, stripe_index);
-    if (spdk_unlikely(stripe == NULL)) {
-        struct raid6_io_channel *r6ch = raid_bdev_io_channel_get_resource(raid_io->raid_ch);
-        struct spdk_bdev_io_wait_entry *wqe = &raid_io->waitq_entry;
-
-        wqe->cb_fn = _raid6_submit_rw_request;
-        wqe->cb_arg = raid_io;
-        TAILQ_INSERT_TAIL(&r6ch->retry_queue, wqe, link);
-        return;
-    }
-
     raid_io->base_bdev_io_remaining = num_blocks;
 
-    raid6_handle_stripe(raid_io, stripe, stripe_offset, num_blocks, 0);
+    while (blocks_remaining > 0) {
+        uint64_t blocks_in_stripe = spdk_min(blocks_remaining,
+                                             r6info->stripe_blocks - stripe_offset);
+
+        stripe = raid6_get_stripe(r6info, stripe_index);
+        if (spdk_unlikely(stripe == NULL)) {
+            struct raid6_io_channel *r6ch = raid_bdev_io_channel_get_resource(raid_io->raid_ch);
+            struct spdk_bdev_io_wait_entry *wqe = &raid_io->waitq_entry;
+
+            if (iov_offset == 0) {
+                wqe->cb_fn = _raid6_submit_rw_request;
+                wqe->cb_arg = raid_io;
+                TAILQ_INSERT_TAIL(&r6ch->retry_queue, wqe, link);
+            } else {
+                raid_bdev_io_complete_part(raid_io, blocks_remaining,
+                                           SPDK_BDEV_IO_STATUS_NOMEM);
+            }
+            return;
+        }
+
+        raid6_handle_stripe(raid_io, stripe, stripe_offset, blocks_in_stripe, iov_offset);
+
+        blocks_remaining -= blocks_in_stripe;
+        iov_offset += blocks_in_stripe * raid_bdev->bdev.blocklen;
+        stripe_index++;
+        stripe_offset = 0;
+    }
 }
 
 static int
