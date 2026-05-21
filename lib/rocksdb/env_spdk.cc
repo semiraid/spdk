@@ -31,12 +31,17 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "../../../../SemiRAID/shared/readerwriterqueue.h"
+#include "../../../draid/shared/readerwriterqueue.h"
 
 #include "rocksdb/env.h"
 #include <set>
 #include <iostream>
 #include <stdexcept>
+#include <cstdlib>
+#include <atomic>
+#include <algorithm>
+#include <cstdint>
+#include <inttypes.h>
 
 extern "C" {
 #include "spdk/env.h"
@@ -58,6 +63,14 @@ uint32_t g_lcore = 0;
 std::string g_bdev_name;
 volatile bool g_spdk_ready = false;
 volatile bool g_spdk_start_failure = false;
+
+struct spdk_bdev_desc *g_prewipe_desc = NULL;
+struct spdk_io_channel *g_prewipe_channel = NULL;
+void *g_prewipe_buffer = NULL;
+uint64_t g_prewipe_offset = 0;
+uint64_t g_prewipe_total = 0;
+uint64_t g_prewipe_chunk = 0;
+uint64_t g_prewipe_current = 0;
 
 void SpdkInitializeThread(void);
 
@@ -659,6 +672,8 @@ static void
 fs_load_cb(__attribute__((unused)) void *ctx,
 	   struct spdk_filesystem *fs, int fserrno)
 {
+	fprintf(stderr, "semiraid_app_trace: fs_load_cb fserrno=%d fs=%p\n", fserrno, fs);
+	fflush(stderr);
 	if (fserrno == 0) {
 		g_fs = fs;
 	}
@@ -673,12 +688,55 @@ base_bdev_event_cb(enum spdk_bdev_event_type type, __attribute__((unused)) struc
 }
 
 static void
-rocksdb_run(__attribute__((unused)) void *arg1)
+cleanup_blobfs_prewipe(void)
+{
+	if (g_prewipe_channel != NULL) {
+		spdk_put_io_channel(g_prewipe_channel);
+		g_prewipe_channel = NULL;
+	}
+	if (g_prewipe_desc != NULL) {
+		spdk_bdev_close(g_prewipe_desc);
+		g_prewipe_desc = NULL;
+	}
+	if (g_prewipe_buffer != NULL) {
+		spdk_free(g_prewipe_buffer);
+		g_prewipe_buffer = NULL;
+	}
+	g_prewipe_offset = 0;
+	g_prewipe_total = 0;
+	g_prewipe_chunk = 0;
+	g_prewipe_current = 0;
+}
+
+static bool
+blobfs_format_requested(void)
+{
+	const char *format = std::getenv("SEMIRAID_APP_BLOBFS_FORMAT_ON_START");
+	return format != nullptr && format[0] != '\0' &&
+	       !(format[0] == '0' && format[1] == '\0');
+}
+
+static uint64_t
+env_u64(const char *name, uint64_t default_value)
+{
+	const char *value = std::getenv(name);
+	if (value == nullptr || value[0] == '\0') {
+		return default_value;
+	}
+	return std::strtoull(value, nullptr, 10);
+}
+
+static void
+start_blobfs_open(void)
 {
 	int rc;
 
+	fprintf(stderr, "semiraid_app_trace: rocksdb_run enter bdev=%s\n", g_bdev_name.c_str());
+	fflush(stderr);
 	rc = spdk_bdev_create_bs_dev_ext(g_bdev_name.c_str(), base_bdev_event_cb, NULL,
 					 &g_bs_dev);
+	fprintf(stderr, "semiraid_app_trace: create_bs_dev rc=%d bs_dev=%p\n", rc, g_bs_dev);
+	fflush(stderr);
 	if (rc != 0) {
 		printf("Could not create blob bdev\n");
 		spdk_app_stop(0);
@@ -688,13 +746,136 @@ rocksdb_run(__attribute__((unused)) void *arg1)
 	g_lcore = spdk_env_get_first_core();
 
 	printf("using bdev %s\n", g_bdev_name.c_str());
-	spdk_fs_load(g_bs_dev, __send_request, fs_load_cb, NULL);
+	fflush(stdout);
+	if (blobfs_format_requested()) {
+		struct spdk_blobfs_opts blobfs_opts;
+		spdk_fs_opts_init(&blobfs_opts);
+		const char *cluster = std::getenv("SEMIRAID_APP_BLOBFS_CLUSTER_SIZE");
+		if (cluster != nullptr && cluster[0] != '\0') {
+				blobfs_opts.cluster_sz = static_cast<uint32_t>(std::strtoul(cluster, nullptr, 10));
+		}
+		fprintf(stderr, "semiraid_app_trace: spdk_fs_init cluster_sz=%u\n",
+			static_cast<unsigned>(blobfs_opts.cluster_sz));
+		fflush(stderr);
+		spdk_fs_init(g_bs_dev, &blobfs_opts, __send_request, fs_load_cb, NULL);
+	} else {
+		fprintf(stderr, "semiraid_app_trace: spdk_fs_load\n");
+		fflush(stderr);
+		spdk_fs_load(g_bs_dev, __send_request, fs_load_cb, NULL);
+	}
+}
+
+static void
+blobfs_prewipe_failed(int rc)
+{
+	fprintf(stderr, "semiraid_app_trace: blobfs pre-wipe failed rc=%d offset=%" PRIu64 "\n",
+		rc, g_prewipe_offset);
+	fflush(stderr);
+	cleanup_blobfs_prewipe();
+	g_spdk_start_failure = true;
+	g_spdk_ready = true;
+	spdk_app_stop(rc == 0 ? 1 : rc);
+}
+
+static void submit_next_blobfs_prewipe(void);
+
+static void
+blobfs_prewipe_done(struct spdk_bdev_io *bdev_io, bool success, __attribute__((unused)) void *cb_arg)
+{
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		blobfs_prewipe_failed(-EIO);
+		return;
+	}
+	g_prewipe_offset += g_prewipe_current;
+	submit_next_blobfs_prewipe();
+}
+
+static void
+submit_next_blobfs_prewipe(void)
+{
+	if (g_prewipe_offset >= g_prewipe_total) {
+		fprintf(stderr, "semiraid_app_trace: blobfs pre-wipe done bytes=%" PRIu64 "\n",
+			g_prewipe_total);
+		fflush(stderr);
+		cleanup_blobfs_prewipe();
+		start_blobfs_open();
+		return;
+	}
+
+	g_prewipe_current = std::min<uint64_t>(g_prewipe_chunk,
+					       g_prewipe_total - g_prewipe_offset);
+	int rc = spdk_bdev_write(g_prewipe_desc, g_prewipe_channel, g_prewipe_buffer,
+				 g_prewipe_offset, g_prewipe_current,
+				 blobfs_prewipe_done, NULL);
+	if (rc != 0) {
+		blobfs_prewipe_failed(rc);
+	}
+}
+
+static void
+maybe_prewipe_blobfs_then_open(void)
+{
+	uint64_t prewipe_bytes = env_u64("SEMIRAID_APP_BLOBFS_PRE_WIPE_BYTES", 0);
+	if (!blobfs_format_requested() || prewipe_bytes == 0) {
+		start_blobfs_open();
+		return;
+	}
+
+	int rc = spdk_bdev_open_ext(g_bdev_name.c_str(), true, base_bdev_event_cb,
+				    NULL, &g_prewipe_desc);
+	if (rc != 0) {
+		blobfs_prewipe_failed(rc);
+		return;
+	}
+
+	struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(g_prewipe_desc);
+	g_prewipe_channel = spdk_bdev_get_io_channel(g_prewipe_desc);
+	if (g_prewipe_channel == NULL) {
+		blobfs_prewipe_failed(-ENOMEM);
+		return;
+	}
+
+	const uint64_t block_size = spdk_bdev_get_block_size(bdev);
+	const uint64_t bdev_bytes = spdk_bdev_get_num_blocks(bdev) * block_size;
+	g_prewipe_total = std::min<uint64_t>(prewipe_bytes, bdev_bytes);
+	g_prewipe_total -= g_prewipe_total % block_size;
+	if (g_prewipe_total == 0) {
+		cleanup_blobfs_prewipe();
+		start_blobfs_open();
+		return;
+	}
+
+	g_prewipe_chunk = std::min<uint64_t>(4ULL * 1024ULL * 1024ULL, g_prewipe_total);
+	g_prewipe_chunk -= g_prewipe_chunk % block_size;
+	if (g_prewipe_chunk == 0) {
+		blobfs_prewipe_failed(-EINVAL);
+		return;
+	}
+	g_prewipe_buffer = spdk_dma_zmalloc(g_prewipe_chunk, 4096, NULL);
+	if (g_prewipe_buffer == NULL) {
+		blobfs_prewipe_failed(-ENOMEM);
+		return;
+	}
+	fprintf(stderr, "semiraid_app_trace: blobfs pre-wipe start bytes=%" PRIu64
+		" chunk=%" PRIu64 "\n",
+		g_prewipe_total, g_prewipe_chunk);
+	fflush(stderr);
+	submit_next_blobfs_prewipe();
+}
+
+static void
+rocksdb_run(__attribute__((unused)) void *arg1)
+{
+	maybe_prewipe_blobfs_then_open();
 }
 
 static void
 fs_unload_cb(__attribute__((unused)) void *ctx,
 	     __attribute__((unused)) int fserrno)
 {
+	fprintf(stderr, "semiraid_app_trace: fs_unload_cb fserrno=%d\n", fserrno);
+	fflush(stderr);
 	assert(fserrno == 0);
 
 	spdk_app_stop(0);
@@ -703,6 +884,8 @@ fs_unload_cb(__attribute__((unused)) void *ctx,
 static void
 rocksdb_shutdown(void)
 {
+	fprintf(stderr, "semiraid_app_trace: rocksdb_shutdown enter fs=%p\n", g_fs);
+	fflush(stderr);
 	if (g_fs != NULL) {
 		spdk_fs_unload(g_fs, fs_unload_cb, NULL);
 	} else {
@@ -710,12 +893,22 @@ rocksdb_shutdown(void)
 	}
 }
 
+static bool kvstore_no_pci_default();
+static void kvstore_apply_bdev_opts_from_env();
+
 static void *
 initialize_spdk(void *arg)
 {
 	struct spdk_app_opts *opts = (struct spdk_app_opts *)arg;
 	int rc;
 
+	kvstore_apply_bdev_opts_from_env();
+	fprintf(stderr, "semiraid_app_trace: spdk_app_start config=%s reactor_mask=%s mem=%d rpc=%s\n",
+		opts->json_config_file ? opts->json_config_file : "",
+		opts->reactor_mask ? opts->reactor_mask : "",
+		opts->mem_size,
+		opts->rpc_addr ? opts->rpc_addr : "");
+	fflush(stderr);
 	rc = spdk_app_start(opts, rocksdb_run, NULL);
 	/*
 	 * TODO:  Revisit for case of internal failure of
@@ -740,13 +933,29 @@ SpdkEnv::SpdkEnv(Env *base_env, const std::string &dir, const std::string &conf,
 	: EnvWrapper(base_env), mDirectory(dir), mConfig(conf), mBdev(bdev)
 {
 	struct spdk_app_opts *opts = new struct spdk_app_opts;
+	const char *reactor_mask = std::getenv("SEMIRAID_APP_SPDK_REACTOR_MASK");
+	const char *rpc_addr = std::getenv("SEMIRAID_APP_SPDK_RPC_ADDR");
+	const char *mem_mb = std::getenv("SEMIRAID_APP_SPDK_MEM_MB");
 
 	spdk_app_opts_init(opts, sizeof(*opts));
 	opts->name = "rocksdb";
 	opts->json_config_file = mConfig.c_str();
 	opts->shutdown_cb = rocksdb_shutdown;
 	opts->tpoint_group_mask = "0x1000";
-    opts->reactor_mask = "0x6000";
+	if (mem_mb != nullptr && mem_mb[0] != '\0') {
+		opts->mem_size = static_cast<int>(std::strtol(mem_mb, nullptr, 10));
+	}
+	opts->reactor_mask = (reactor_mask != nullptr && reactor_mask[0] != '\0') ?
+		reactor_mask : "0x6000";
+	if (rpc_addr != nullptr && rpc_addr[0] != '\0') {
+		opts->rpc_addr = rpc_addr;
+	}
+	opts->num_entries = 0;
+	opts->no_pci = kvstore_no_pci_default();
+	opts->iova_mode = std::getenv("SEMIRAID_APP_SPDK_IOVA_MODE");
+	if (opts->iova_mode == nullptr || opts->iova_mode[0] == '\0') {
+		opts->iova_mode = "va";
+	}
 
 	spdk_fs_set_cache_size(cache_size_in_mb);
 	g_bdev_name = mBdev;
@@ -764,6 +973,8 @@ SpdkEnv::SpdkEnv(Env *base_env, const std::string &dir, const std::string &conf,
 
 SpdkEnv::~SpdkEnv()
 {
+	fprintf(stderr, "semiraid_app_trace: SpdkEnv dtor enter\n");
+	fflush(stderr);
 	/* This is a workaround for rocksdb test, we close the files if the rocksdb not
 	 * do the work before the test quit.
 	 */
@@ -772,19 +983,45 @@ SpdkEnv::~SpdkEnv()
 		struct spdk_file *file;
 
 		if (!g_sync_args.channel) {
+			fprintf(stderr, "semiraid_app_trace: SpdkEnv dtor initialize thread ctx\n");
+			fflush(stderr);
 			SpdkInitializeThread();
 		}
 
+		fprintf(stderr, "semiraid_app_trace: SpdkEnv dtor close files begin\n");
+		fflush(stderr);
 		iter = spdk_fs_iter_first(g_fs);
 		while (iter != NULL) {
 			file = spdk_fs_iter_get_file(iter);
 			spdk_file_close(file, g_sync_args.channel);
 			iter = spdk_fs_iter_next(iter);
 		}
+		fprintf(stderr, "semiraid_app_trace: SpdkEnv dtor close files done\n");
+		fflush(stderr);
+		if (g_sync_args.channel) {
+			fprintf(stderr, "semiraid_app_trace: SpdkEnv dtor free thread ctx\n");
+			fflush(stderr);
+			spdk_fs_free_thread_ctx(g_sync_args.channel);
+			g_sync_args.channel = nullptr;
+		}
 	}
 
+	fprintf(stderr, "semiraid_app_trace: SpdkEnv dtor before app_start_shutdown\n");
+	fflush(stderr);
 	spdk_app_start_shutdown();
+	const char *skip_join = std::getenv("SEMIRAID_APP_SKIP_SPDK_JOIN_ON_SHUTDOWN");
+	if (skip_join != nullptr && skip_join[0] != '\0' &&
+	    !(skip_join[0] == '0' && skip_join[1] == '\0')) {
+		fprintf(stderr, "semiraid_app_trace: SpdkEnv dtor skip pthread_join\n");
+		fflush(stderr);
+		pthread_detach(mSpdkTid);
+		return;
+	}
+	fprintf(stderr, "semiraid_app_trace: SpdkEnv dtor before pthread_join\n");
+	fflush(stderr);
 	pthread_join(mSpdkTid, NULL);
+	fprintf(stderr, "semiraid_app_trace: SpdkEnv dtor done\n");
+	fflush(stderr);
 }
 
 Env *NewSpdkEnv(Env *base_env, const std::string &dir, const std::string &conf,
@@ -957,7 +1194,37 @@ hello_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
 }
 
 static pthread_t init_thread;
-static bool init_spdk = false;
+static std::atomic<bool> init_spdk{false};
+static std::atomic<bool> init_spdk_failed{false};
+
+static bool kvstore_no_pci_default()
+{
+    const char *env = std::getenv("SEMIRAID_APP_SPDK_NO_PCI");
+    return env == nullptr || env[0] == '\0' || !(env[0] == '0' && env[1] == '\0');
+}
+
+static void kvstore_apply_bdev_opts_from_env()
+{
+    const char *pool = std::getenv("SEMIRAID_APP_BDEV_IO_POOL_SIZE");
+    const char *cache = std::getenv("SEMIRAID_APP_BDEV_IO_CACHE_SIZE");
+    if ((pool == nullptr || pool[0] == '\0') &&
+        (cache == nullptr || cache[0] == '\0')) {
+        return;
+    }
+
+    struct spdk_bdev_opts bdev_opts = {};
+    spdk_bdev_get_opts(&bdev_opts, sizeof(bdev_opts));
+    if (pool != nullptr && pool[0] != '\0') {
+        bdev_opts.bdev_io_pool_size = static_cast<uint32_t>(std::strtoul(pool, nullptr, 10));
+    }
+    if (cache != nullptr && cache[0] != '\0') {
+        bdev_opts.bdev_io_cache_size = static_cast<uint32_t>(std::strtoul(cache, nullptr, 10));
+    }
+    int rc = spdk_bdev_set_opts(&bdev_opts);
+    if (rc != 0) {
+        SPDK_ERRLOG("failed to set bdev options from environment: %d\n", rc);
+    }
+}
 
 static void kvstore_start(void* arg) {
 	SPDK_NOTICELOG("kvstore start\n");
@@ -1024,7 +1291,7 @@ static void kvstore_start(void* arg) {
 
     }
 
-	init_spdk = true;
+	init_spdk.store(true, std::memory_order_release);
 
 	SPDK_NOTICELOG("start finish\n");
 }
@@ -1067,9 +1334,11 @@ void spdk_KVStore::Read(void* dst, uint64_t offset, uint64_t length) {
 static void * init_kvstore(void* arg) {
 	struct spdk_app_opts *opts = (struct spdk_app_opts *)arg;
 
+    kvstore_apply_bdev_opts_from_env();
     int rc = spdk_app_start(opts, kvstore_start, g_hello_context);
 
     if (rc) {
+        init_spdk_failed.store(true, std::memory_order_release);
         delete opts;
         SPDK_ERRLOG("cannot start kvstore\n");
     }
@@ -1082,13 +1351,29 @@ spdk_KVStore::spdk_KVStore(const std::string &_conf, const std::string &_bdev_na
     int rc;
 
     struct spdk_app_opts *opts = new struct spdk_app_opts;
+    const char *reactor_mask = std::getenv("SEMIRAID_APP_SPDK_REACTOR_MASK");
+    const char *rpc_addr = std::getenv("SEMIRAID_APP_SPDK_RPC_ADDR");
+    const char *mem_mb = std::getenv("SEMIRAID_APP_SPDK_MEM_MB");
 
     sem_init(&g_hello_context->sem, 0, 0);
 
     spdk_app_opts_init(opts, sizeof(*opts));
     opts->name = "kvstore";
     opts->json_config_file = _conf.c_str();
-    opts->reactor_mask = "0x3000";
+    if (mem_mb != nullptr && mem_mb[0] != '\0') {
+        opts->mem_size = static_cast<int>(std::strtol(mem_mb, nullptr, 10));
+    }
+    opts->reactor_mask = (reactor_mask != nullptr && reactor_mask[0] != '\0') ?
+        reactor_mask : "0x3000";
+    if (rpc_addr != nullptr && rpc_addr[0] != '\0') {
+        opts->rpc_addr = rpc_addr;
+    }
+    opts->num_entries = 0;
+    opts->no_pci = kvstore_no_pci_default();
+    opts->iova_mode = std::getenv("SEMIRAID_APP_SPDK_IOVA_MODE");
+    if (opts->iova_mode == nullptr || opts->iova_mode[0] == '\0') {
+        opts->iova_mode = "va";
+    }
 
     g_hello_context->bdev_name = _bdev_name.c_str();
 
@@ -1096,10 +1381,17 @@ spdk_KVStore::spdk_KVStore(const std::string &_conf, const std::string &_bdev_na
 
 	pthread_create(&init_thread, NULL, &init_kvstore, opts);
 
-	// while(!init_spdk) {
-	// 	printf("initing...\n");
-	// }
-	sleep(10);
+    int waited_ms = 0;
+    while (!init_spdk.load(std::memory_order_acquire) &&
+           !init_spdk_failed.load(std::memory_order_acquire) &&
+           waited_ms < 30000) {
+        usleep(10000);
+        waited_ms += 10;
+    }
+    if (!init_spdk.load(std::memory_order_acquire)) {
+        init_spdk_failed.store(true, std::memory_order_release);
+        throw SpdkAppStartException("spdk_app_start() unable to start kvstore");
+    }
 
 	SPDK_NOTICELOG("create spdk kvstore\n");
 }

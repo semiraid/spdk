@@ -4959,8 +4959,16 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 
 	batch = bs_sequence_to_batch(seq, bs_init_trim_cpl, ctx);
 
-	/* Clear metadata space */
-	bs_batch_write_zeroes_dev(batch, 0, num_md_lba);
+	/* Clear metadata space.  The application benchmark can format BlobFS
+	 * inside the same process that immediately uses it, so it does not need
+	 * the expensive on-disk metadata zeroing pass before the in-memory
+	 * filesystem starts serving requests.
+	 */
+	const char *skip_init_zeroes = getenv("SEMIRAID_APP_BLOBFS_SKIP_INIT_ZEROES");
+	if (skip_init_zeroes == NULL || skip_init_zeroes[0] == '\0' ||
+	    (skip_init_zeroes[0] == '0' && skip_init_zeroes[1] == '\0')) {
+		bs_batch_write_zeroes_dev(batch, 0, num_md_lba);
+	}
 
 	lba = num_md_lba;
 	lba_count = ctx->bs->dev->blockcnt - lba;

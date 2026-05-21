@@ -551,6 +551,14 @@ static struct spdk_filesystem *
 fs_alloc(struct spdk_bs_dev *dev, fs_send_request_fn send_request_fn)
 {
 	struct spdk_filesystem *fs;
+	uint32_t max_ops = 512;
+	const char *max_ops_env = getenv("SEMIRAID_APP_BLOBFS_MAX_OPS");
+	if (max_ops_env != NULL && max_ops_env[0] != '\0') {
+		uint32_t parsed = (uint32_t)strtoul(max_ops_env, NULL, 10);
+		if (parsed > 0) {
+			max_ops = parsed;
+		}
+	}
 
 	fs = calloc(1, sizeof(*fs));
 	if (fs == NULL) {
@@ -561,19 +569,19 @@ fs_alloc(struct spdk_bs_dev *dev, fs_send_request_fn send_request_fn)
 	fs->send_request = send_request_fn;
 	TAILQ_INIT(&fs->files);
 
-	fs->md_target.max_ops = 512;
+	fs->md_target.max_ops = max_ops;
 	spdk_io_device_register(&fs->md_target, fs_md_channel_create, fs_channel_destroy,
 				sizeof(struct spdk_fs_channel), "blobfs_md");
 	fs->md_target.md_io_channel = spdk_get_io_channel(&fs->md_target);
 	fs->md_target.md_fs_channel = spdk_io_channel_get_ctx(fs->md_target.md_io_channel);
 
-	fs->sync_target.max_ops = 512;
+	fs->sync_target.max_ops = max_ops;
 	spdk_io_device_register(&fs->sync_target, fs_sync_channel_create, fs_channel_destroy,
 				sizeof(struct spdk_fs_channel), "blobfs_sync");
 	fs->sync_target.sync_io_channel = spdk_get_io_channel(&fs->sync_target);
 	fs->sync_target.sync_fs_channel = spdk_io_channel_get_ctx(fs->sync_target.sync_io_channel);
 
-	fs->io_target.max_ops = 512;
+	fs->io_target.max_ops = max_ops;
 	spdk_io_device_register(&fs->io_target, fs_io_channel_create, fs_channel_destroy,
 				sizeof(struct spdk_fs_channel), "blobfs_io");
 
@@ -623,6 +631,24 @@ spdk_fs_init(struct spdk_bs_dev *dev, struct spdk_blobfs_opts *opt,
 
 	spdk_bs_opts_init(&opts, sizeof(opts));
 	snprintf(opts.bstype.bstype, sizeof(opts.bstype.bstype), SPDK_BLOBFS_SIGNATURE);
+	const char *num_md_pages = getenv("SEMIRAID_APP_BLOBFS_NUM_MD_PAGES");
+	if (num_md_pages != NULL && num_md_pages[0] != '\0') {
+		uint32_t pages = (uint32_t)strtoul(num_md_pages, NULL, 10);
+		if (pages > 0) {
+			opts.num_md_pages = pages;
+			opts.max_md_ops = pages;
+		}
+	}
+	const char *clear_method = getenv("SEMIRAID_APP_BLOBFS_CLEAR_METHOD");
+	if (clear_method != NULL && clear_method[0] != '\0') {
+		if (strcmp(clear_method, "none") == 0) {
+			opts.clear_method = BS_CLEAR_WITH_NONE;
+		} else if (strcmp(clear_method, "write_zeroes") == 0) {
+			opts.clear_method = BS_CLEAR_WITH_WRITE_ZEROES;
+		} else if (strcmp(clear_method, "unmap") == 0) {
+			opts.clear_method = BS_CLEAR_WITH_UNMAP;
+		}
+	}
 	if (opt) {
 		opts.cluster_sz = opt->cluster_sz;
 	}

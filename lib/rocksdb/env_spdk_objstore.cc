@@ -31,12 +31,14 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "../../../../SemiRAID/shared/readerwriterqueue.h"
+#include "../../../draid/shared/readerwriterqueue.h"
 
 #include "rocksdb/env.h"
 #include <set>
 #include <iostream>
 #include <stdexcept>
+#include <cstdlib>
+#include <atomic>
 
 extern "C" {
 #include "spdk/env.h"
@@ -688,7 +690,19 @@ rocksdb_run(__attribute__((unused)) void *arg1)
 	g_lcore = spdk_env_get_first_core();
 
 	printf("using bdev %s\n", g_bdev_name.c_str());
-	spdk_fs_load(g_bs_dev, __send_request, fs_load_cb, NULL);
+	const char *format = std::getenv("SEMIRAID_APP_BLOBFS_FORMAT_ON_START");
+	if (format != nullptr && format[0] != '\0' &&
+	    !(format[0] == '0' && format[1] == '\0')) {
+		struct spdk_blobfs_opts blobfs_opts;
+		spdk_fs_opts_init(&blobfs_opts);
+		const char *cluster = std::getenv("SEMIRAID_APP_BLOBFS_CLUSTER_SIZE");
+		if (cluster != nullptr && cluster[0] != '\0') {
+			blobfs_opts.cluster_sz = static_cast<uint32_t>(std::strtoul(cluster, nullptr, 10));
+		}
+		spdk_fs_init(g_bs_dev, &blobfs_opts, __send_request, fs_load_cb, NULL);
+	} else {
+		spdk_fs_load(g_bs_dev, __send_request, fs_load_cb, NULL);
+	}
 }
 
 static void
@@ -710,12 +724,16 @@ rocksdb_shutdown(void)
 	}
 }
 
+static bool kvstore_no_pci_default();
+static void kvstore_apply_bdev_opts_from_env();
+
 static void *
 initialize_spdk(void *arg)
 {
 	struct spdk_app_opts *opts = (struct spdk_app_opts *)arg;
 	int rc;
 
+	kvstore_apply_bdev_opts_from_env();
 	rc = spdk_app_start(opts, rocksdb_run, NULL);
 	/*
 	 * TODO:  Revisit for case of internal failure of
@@ -740,13 +758,29 @@ SpdkEnv::SpdkEnv(Env *base_env, const std::string &dir, const std::string &conf,
 	: EnvWrapper(base_env), mDirectory(dir), mConfig(conf), mBdev(bdev)
 {
 	struct spdk_app_opts *opts = new struct spdk_app_opts;
+	const char *reactor_mask = std::getenv("SEMIRAID_APP_SPDK_REACTOR_MASK");
+	const char *rpc_addr = std::getenv("SEMIRAID_APP_SPDK_RPC_ADDR");
+	const char *mem_mb = std::getenv("SEMIRAID_APP_SPDK_MEM_MB");
 
 	spdk_app_opts_init(opts, sizeof(*opts));
 	opts->name = "rocksdb";
 	opts->json_config_file = mConfig.c_str();
 	opts->shutdown_cb = rocksdb_shutdown;
 	opts->tpoint_group_mask = "0x1000";
-    opts->reactor_mask = "0x6000";
+	if (mem_mb != nullptr && mem_mb[0] != '\0') {
+		opts->mem_size = static_cast<int>(std::strtol(mem_mb, nullptr, 10));
+	}
+	opts->reactor_mask = (reactor_mask != nullptr && reactor_mask[0] != '\0') ?
+		reactor_mask : "0x6000";
+	if (rpc_addr != nullptr && rpc_addr[0] != '\0') {
+		opts->rpc_addr = rpc_addr;
+	}
+	opts->num_entries = 0;
+	opts->no_pci = kvstore_no_pci_default();
+	opts->iova_mode = std::getenv("SEMIRAID_APP_SPDK_IOVA_MODE");
+	if (opts->iova_mode == nullptr || opts->iova_mode[0] == '\0') {
+		opts->iova_mode = "va";
+	}
 
 	spdk_fs_set_cache_size(cache_size_in_mb);
 	g_bdev_name = mBdev;
@@ -957,7 +991,37 @@ hello_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
 }
 
 static pthread_t init_thread;
-static bool init_spdk = false;
+static std::atomic<bool> init_spdk{false};
+static std::atomic<bool> init_spdk_failed{false};
+
+static bool kvstore_no_pci_default()
+{
+    const char *env = std::getenv("SEMIRAID_APP_SPDK_NO_PCI");
+    return env == nullptr || env[0] == '\0' || !(env[0] == '0' && env[1] == '\0');
+}
+
+static void kvstore_apply_bdev_opts_from_env()
+{
+    const char *pool = std::getenv("SEMIRAID_APP_BDEV_IO_POOL_SIZE");
+    const char *cache = std::getenv("SEMIRAID_APP_BDEV_IO_CACHE_SIZE");
+    if ((pool == nullptr || pool[0] == '\0') &&
+        (cache == nullptr || cache[0] == '\0')) {
+        return;
+    }
+
+    struct spdk_bdev_opts bdev_opts = {};
+    spdk_bdev_get_opts(&bdev_opts, sizeof(bdev_opts));
+    if (pool != nullptr && pool[0] != '\0') {
+        bdev_opts.bdev_io_pool_size = static_cast<uint32_t>(std::strtoul(pool, nullptr, 10));
+    }
+    if (cache != nullptr && cache[0] != '\0') {
+        bdev_opts.bdev_io_cache_size = static_cast<uint32_t>(std::strtoul(cache, nullptr, 10));
+    }
+    int rc = spdk_bdev_set_opts(&bdev_opts);
+    if (rc != 0) {
+        SPDK_ERRLOG("failed to set bdev options from environment: %d\n", rc);
+    }
+}
 
 static void kvstore_start(void* arg) {
 	SPDK_NOTICELOG("kvstore start\n");
@@ -1024,7 +1088,7 @@ static void kvstore_start(void* arg) {
 
     }
 
-	init_spdk = true;
+	init_spdk.store(true, std::memory_order_release);
 
 	SPDK_NOTICELOG("start finish\n");
 }
@@ -1067,9 +1131,11 @@ void spdk_KVStore::Read(void* dst, uint64_t offset, uint64_t length) {
 static void * init_kvstore(void* arg) {
 	struct spdk_app_opts *opts = (struct spdk_app_opts *)arg;
 
+    kvstore_apply_bdev_opts_from_env();
     int rc = spdk_app_start(opts, kvstore_start, g_hello_context);
 
     if (rc) {
+        init_spdk_failed.store(true, std::memory_order_release);
         delete opts;
         SPDK_ERRLOG("cannot start kvstore\n");
     }
@@ -1082,13 +1148,29 @@ spdk_KVStore::spdk_KVStore(const std::string &_conf, const std::string &_bdev_na
     int rc;
 
     struct spdk_app_opts *opts = new struct spdk_app_opts;
+    const char *reactor_mask = std::getenv("SEMIRAID_APP_SPDK_REACTOR_MASK");
+    const char *rpc_addr = std::getenv("SEMIRAID_APP_SPDK_RPC_ADDR");
+    const char *mem_mb = std::getenv("SEMIRAID_APP_SPDK_MEM_MB");
 
     sem_init(&g_hello_context->sem, 0, 0);
 
     spdk_app_opts_init(opts, sizeof(*opts));
     opts->name = "kvstore";
     opts->json_config_file = _conf.c_str();
-    opts->reactor_mask = "0x3000";
+    if (mem_mb != nullptr && mem_mb[0] != '\0') {
+        opts->mem_size = static_cast<int>(std::strtol(mem_mb, nullptr, 10));
+    }
+    opts->reactor_mask = (reactor_mask != nullptr && reactor_mask[0] != '\0') ?
+        reactor_mask : "0x3000";
+    if (rpc_addr != nullptr && rpc_addr[0] != '\0') {
+        opts->rpc_addr = rpc_addr;
+    }
+    opts->num_entries = 0;
+    opts->no_pci = kvstore_no_pci_default();
+    opts->iova_mode = std::getenv("SEMIRAID_APP_SPDK_IOVA_MODE");
+    if (opts->iova_mode == nullptr || opts->iova_mode[0] == '\0') {
+        opts->iova_mode = "va";
+    }
 
     g_hello_context->bdev_name = _bdev_name.c_str();
 
@@ -1096,10 +1178,17 @@ spdk_KVStore::spdk_KVStore(const std::string &_conf, const std::string &_bdev_na
 
 	pthread_create(&init_thread, NULL, &init_kvstore, opts);
 
-	// while(!init_spdk) {
-	// 	printf("initing...\n");
-	// }
-	sleep(10);
+    int waited_ms = 0;
+    while (!init_spdk.load(std::memory_order_acquire) &&
+           !init_spdk_failed.load(std::memory_order_acquire) &&
+           waited_ms < 30000) {
+        usleep(10000);
+        waited_ms += 10;
+    }
+    if (!init_spdk.load(std::memory_order_acquire)) {
+        init_spdk_failed.store(true, std::memory_order_release);
+        throw SpdkAppStartException("spdk_app_start() unable to start kvstore");
+    }
 
 	SPDK_NOTICELOG("create spdk kvstore\n");
 }
