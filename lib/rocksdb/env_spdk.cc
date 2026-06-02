@@ -726,6 +726,14 @@ env_u64(const char *name, uint64_t default_value)
 	return std::strtoull(value, nullptr, 10);
 }
 
+static bool
+env_enabled(const char *name)
+{
+	const char *value = std::getenv(name);
+	return value != nullptr && value[0] != '\0' &&
+	       !(value[0] == '0' && value[1] == '\0');
+}
+
 static void
 start_blobfs_open(void)
 {
@@ -886,6 +894,12 @@ rocksdb_shutdown(void)
 {
 	fprintf(stderr, "semiraid_app_trace: rocksdb_shutdown enter fs=%p\n", g_fs);
 	fflush(stderr);
+	if (env_enabled("SEMIRAID_APP_SKIP_BLOBFS_UNLOAD_ON_SHUTDOWN")) {
+		fprintf(stderr, "semiraid_app_trace: rocksdb_shutdown skip fs unload\n");
+		fflush(stderr);
+		spdk_app_stop(0);
+		return;
+	}
 	if (g_fs != NULL) {
 		spdk_fs_unload(g_fs, fs_unload_cb, NULL);
 	} else {
@@ -1009,9 +1023,7 @@ SpdkEnv::~SpdkEnv()
 	fprintf(stderr, "semiraid_app_trace: SpdkEnv dtor before app_start_shutdown\n");
 	fflush(stderr);
 	spdk_app_start_shutdown();
-	const char *skip_join = std::getenv("SEMIRAID_APP_SKIP_SPDK_JOIN_ON_SHUTDOWN");
-	if (skip_join != nullptr && skip_join[0] != '\0' &&
-	    !(skip_join[0] == '0' && skip_join[1] == '\0')) {
+	if (env_enabled("SEMIRAID_APP_SKIP_SPDK_JOIN_ON_SHUTDOWN")) {
 		fprintf(stderr, "semiraid_app_trace: SpdkEnv dtor skip pthread_join\n");
 		fflush(stderr);
 		pthread_detach(mSpdkTid);
