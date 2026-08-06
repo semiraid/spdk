@@ -181,6 +181,9 @@ CONFIG_FUSE=n
 # Build with RAID5 support
 CONFIG_RAID5=n
 
+# Build the evaluation-only SemiRAID latency-breakdown hooks
+CONFIG_SEMIRAID_LATENCY_BREAKDOWN=n
+
 # Build with IDXD support
 # In this mode, SPDK fully controls the DSA device.
 CONFIG_IDXD=n

@@ -40,6 +40,10 @@ FIO_PLUGIN := spdk_bdev
 
 C_SRCS = fio_plugin.c
 
+ifeq ($(CONFIG_SEMIRAID_LATENCY_BREAKDOWN),y)
+C_SRCS += semiraid_latency_breakdown_recorder.c
+endif
+
 SPDK_LIB_LIST = $(ALL_MODULES_LIST) event event_bdev
 
 include $(SPDK_ROOT_DIR)/mk/spdk.fio.mk

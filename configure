@@ -97,6 +97,8 @@ function usage() {
 	echo "                           No path required."
 	echo " raid5                     Build with bdev_raid module RAID5 support."
 	echo "                           No path required."
+	echo " semiraid-latency-breakdown Build evaluation-only full-population latency hooks."
+	echo "                           Disabled by default."
 	echo " wpdk                      Build using WPDK to provide support for Windows (experimental)."
 	echo "                           The argument must be a directory containing lib and include."
 	echo " usdt                      Build with userspace DTrace probes enabled."
@@ -465,6 +467,12 @@ for i in "$@"; do
 			;;
 		--without-raid5)
 			CONFIG[RAID5]=n
+			;;
+		--with-semiraid-latency-breakdown)
+			CONFIG[SEMIRAID_LATENCY_BREAKDOWN]=y
+			;;
+		--without-semiraid-latency-breakdown)
+			CONFIG[SEMIRAID_LATENCY_BREAKDOWN]=n
 			;;
 		--with-idxd)
 			CONFIG[IDXD]=y

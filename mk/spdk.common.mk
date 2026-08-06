@@ -286,6 +286,11 @@ endif
 
 ifneq ($(OS),Windows)
 COMMON_CFLAGS += -pthread
+
+ifeq ($(CONFIG_SEMIRAID_LATENCY_BREAKDOWN),y)
+COMMON_CFLAGS += -DSEMIRAID_ENABLE_LATENCY_BREAKDOWN=1
+COMMON_CFLAGS += -I$(SPDK_ROOT_DIR)/../../test/shared/latency_breakdown/include
+endif
 SYS_LIBS += -pthread
 endif
 

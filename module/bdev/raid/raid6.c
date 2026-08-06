@@ -6,6 +6,9 @@
 #include "spdk/likely.h"
 #include "spdk/string.h"
 #include "spdk/util.h"
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+#include "semiraid_latency_breakdown.h"
+#endif
 
 #include "spdk/log.h"
 
@@ -113,6 +116,10 @@ struct stripe_request {
 
         /* For retrying base bdev IOs in case submit fails with -ENOMEM */
         struct spdk_bdev_io_wait_entry waitq_entry;
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+        uint64_t latency_breakdown_correlation_id;
+        uint64_t latency_breakdown_submit_ticks;
+#endif
     } chunks[0];
 };
 
@@ -1026,6 +1033,23 @@ raid6_complete_chunk_request(struct spdk_bdev_io *bdev_io, bool success, void *c
     struct chunk *chunk = cb_arg;
     struct stripe_request *stripe_req = raid6_chunk_stripe_req(chunk);
 
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+    if (chunk->latency_breakdown_correlation_id != 0 &&
+        chunk->latency_breakdown_submit_ticks != 0) {
+        semiraid_lb_emit_host_command(
+            stripe_req->raid_io->latency_breakdown_request_id,
+            chunk->latency_breakdown_correlation_id,
+            chunk->index,
+            semiraid_lb_stage_for_operation(
+                chunk->request_type == CHUNK_WRITE ? SEMIRAID_LB_OP_WRITE : SEMIRAID_LB_OP_READ),
+            chunk->request_type == CHUNK_WRITE ? SEMIRAID_LB_OP_WRITE : SEMIRAID_LB_OP_READ,
+            chunk->latency_breakdown_submit_ticks,
+            spdk_get_ticks(),
+            success ? SEMIRAID_LB_FLAG_SUCCESS : 0);
+        chunk->latency_breakdown_correlation_id = 0;
+        chunk->latency_breakdown_submit_ticks = 0;
+    }
+#endif
     spdk_bdev_free_io(bdev_io);
 
     if (!success) {
@@ -1074,6 +1098,11 @@ _raid6_submit_chunk_request(void *_chunk)
 
     base_offset_blocks = (stripe_req->stripe->index << raid_bdev->strip_size_shift) + offset_blocks;
 
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+    chunk->latency_breakdown_correlation_id = 0;
+    chunk->latency_breakdown_submit_ticks = spdk_get_ticks();
+#endif
+
     if (io_type == SPDK_BDEV_IO_TYPE_READ) {
         ret = spdk_bdev_readv_blocks(base_info->desc, base_ch,
                                      chunk->iovs, chunk->iovcnt,
@@ -1089,6 +1118,9 @@ _raid6_submit_chunk_request(void *_chunk)
     }
 
     if (spdk_unlikely(ret != 0)) {
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+        chunk->latency_breakdown_submit_ticks = 0;
+#endif
         if (ret == -ENOMEM) {
             struct spdk_bdev_io_wait_entry *wqe = &chunk->waitq_entry;
 
@@ -1100,6 +1132,11 @@ _raid6_submit_chunk_request(void *_chunk)
             SPDK_ERRLOG("bdev io submit error not due to ENOMEM, it should not happen\n");
             assert(false);
         }
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+    } else {
+        chunk->latency_breakdown_correlation_id =
+            ++raid_io->raid_ch->latency_breakdown_target_sequence[chunk->index];
+#endif
     }
 }
 
@@ -2405,6 +2442,22 @@ raid6_complete_chunk_request_read(struct spdk_bdev_io *bdev_io, bool success, vo
     struct raid_bdev_io *raid_io = iov_w->raid_io;
     struct raid6_io_channel *r6ch = (struct raid6_io_channel*) raid_bdev_io_channel_get_resource(raid_io->raid_ch);
 
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+    if (iov_w->latency_breakdown_correlation_id != 0 &&
+        iov_w->latency_breakdown_submit_ticks != 0) {
+        semiraid_lb_emit_host_command(
+            raid_io->latency_breakdown_request_id,
+            iov_w->latency_breakdown_correlation_id,
+            iov_w->latency_breakdown_target_id,
+            SEMIRAID_LB_STAGE_READ,
+            SEMIRAID_LB_OP_READ,
+            iov_w->latency_breakdown_submit_ticks,
+            spdk_get_ticks(),
+            success ? SEMIRAID_LB_FLAG_SUCCESS : 0);
+        iov_w->latency_breakdown_correlation_id = 0;
+        iov_w->latency_breakdown_submit_ticks = 0;
+    }
+#endif
     spdk_bdev_free_io(bdev_io);
 
     raid_bdev_io_complete_part(raid_io, iov_w->num_blocks, success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED);
@@ -2549,8 +2602,25 @@ raid6_handle_read(struct raid_bdev_io *raid_io, uint64_t stripe_index, uint64_t 
             base_ch = raid_io->raid_ch->base_channel[i];
             base_offset_blocks = (stripe_index << raid_bdev->strip_size_shift) + chunk_req_offset;
 
-            spdk_bdev_readv_blocks(base_info->desc, base_ch, iov_w->iovs, chunk_iovcnt, base_offset_blocks,
-                                   chunk_req_blocks, raid6_complete_chunk_request_read, iov_w);
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+            iov_w->latency_breakdown_correlation_id = 0;
+            iov_w->latency_breakdown_submit_ticks = spdk_get_ticks();
+            iov_w->latency_breakdown_target_id = i;
+            int submit_rc = spdk_bdev_readv_blocks(
+                base_info->desc, base_ch, iov_w->iovs, chunk_iovcnt, base_offset_blocks,
+                chunk_req_blocks, raid6_complete_chunk_request_read, iov_w);
+            if (submit_rc == 0) {
+                iov_w->latency_breakdown_correlation_id =
+                    ++raid_io->raid_ch->latency_breakdown_target_sequence[i];
+            } else {
+                iov_w->latency_breakdown_submit_ticks = 0;
+            }
+#else
+            spdk_bdev_readv_blocks(base_info->desc, base_ch, iov_w->iovs,
+                                   chunk_iovcnt, base_offset_blocks,
+                                   chunk_req_blocks,
+                                   raid6_complete_chunk_request_read, iov_w);
+#endif
         }
     }
 

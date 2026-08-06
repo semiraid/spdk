@@ -42,12 +42,14 @@
 #include "spdk/likely.h"
 #include "spdk/nvme.h"
 #include "spdk/nvmf_cmd.h"
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+#include "semiraid_latency_breakdown.h"
+#endif
 #include "spdk/nvmf_spec.h"
 #include "spdk/trace.h"
 #include "spdk/scsi_spec.h"
 #include "spdk/string.h"
 #include "spdk/util.h"
-
 #include "spdk/log.h"
 
 static bool
@@ -97,6 +99,22 @@ nvmf_bdev_ctrlr_complete_cmd(struct spdk_bdev_io *bdev_io, bool success,
 	int				first_sc = 0, first_sct = 0, sc = 0, sct = 0;
 	uint32_t			cdw0 = 0;
 	struct spdk_nvmf_request	*first_req = req->first_fused_req;
+
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	if (req->latency_breakdown_correlation_id != 0 &&
+	    req->latency_breakdown_ssd_submit_ticks != 0) {
+		const uint64_t complete_ticks = spdk_get_ticks();
+		semiraid_lb_emit_target_ssd(
+			req->latency_breakdown_correlation_id,
+			semiraid_lb_target_id(),
+			semiraid_lb_stage_for_operation(req->latency_breakdown_operation),
+			req->latency_breakdown_operation,
+			req->latency_breakdown_ssd_submit_ticks,
+			complete_ticks,
+			success ? SEMIRAID_LB_FLAG_SUCCESS : 0);
+		req->latency_breakdown_ssd_submit_ticks = 0;
+	}
+#endif
 
 	if (spdk_unlikely(first_req != NULL)) {
 		/* fused commands - get status for both operations */
@@ -313,9 +331,15 @@ nvmf_bdev_ctrlr_read_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 
 	assert(!spdk_nvmf_using_zcopy(req->zcopy_phase));
 
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	req->latency_breakdown_ssd_submit_ticks = spdk_get_ticks();
+#endif
 	rc = spdk_bdev_readv_blocks(desc, ch, req->iov, req->iovcnt, start_lba, num_blocks,
 				    nvmf_bdev_ctrlr_complete_cmd, req);
 	if (spdk_unlikely(rc)) {
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+		req->latency_breakdown_ssd_submit_ticks = 0;
+#endif
 		if (rc == -ENOMEM) {
 			nvmf_bdev_ctrl_queue_io(req, bdev, ch, nvmf_ctrlr_process_io_cmd_resubmit, req);
 			return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
@@ -364,9 +388,15 @@ nvmf_bdev_ctrlr_write_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 
 	assert(!spdk_nvmf_using_zcopy(req->zcopy_phase));
 
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	req->latency_breakdown_ssd_submit_ticks = spdk_get_ticks();
+#endif
 	rc = spdk_bdev_writev_blocks(desc, ch, req->iov, req->iovcnt, start_lba, num_blocks,
 				     nvmf_bdev_ctrlr_complete_cmd, req);
 	if (spdk_unlikely(rc)) {
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+		req->latency_breakdown_ssd_submit_ticks = 0;
+#endif
 		if (rc == -ENOMEM) {
 			nvmf_bdev_ctrl_queue_io(req, bdev, ch, nvmf_ctrlr_process_io_cmd_resubmit, req);
 			return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;

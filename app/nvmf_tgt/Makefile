@@ -39,6 +39,10 @@ APP = nvmf_tgt
 
 C_SRCS := nvmf_main.c
 
+ifeq ($(CONFIG_SEMIRAID_LATENCY_BREAKDOWN),y)
+C_SRCS += semiraid_latency_breakdown_recorder.c
+endif
+
 SPDK_LIB_LIST = $(ALL_MODULES_LIST) event event_nvmf
 
 ifeq ($(SPDK_ROOT_DIR)/lib/env_dpdk,$(CONFIG_ENV))

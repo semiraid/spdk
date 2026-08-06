@@ -118,6 +118,12 @@ struct spdk_nvmf_request {
 	struct spdk_poller		*poller;
 	struct spdk_bdev_io		*zcopy_bdev_io; /* Contains the bdev_io when using ZCOPY */
 	enum spdk_nvmf_zcopy_phase	zcopy_phase;
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	uint64_t			latency_breakdown_correlation_id;
+	uint64_t			latency_breakdown_receive_ticks;
+	uint64_t			latency_breakdown_ssd_submit_ticks;
+	uint8_t			latency_breakdown_operation;
+#endif
 
 	TAILQ_ENTRY(spdk_nvmf_request)	link;
 };
@@ -144,6 +150,9 @@ struct spdk_nvmf_qpair {
 	uint16_t				sq_head;
 	uint16_t				sq_head_max;
 	bool					disconnect_started;
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	uint64_t				latency_breakdown_sequence;
+#endif
 
 	struct spdk_nvmf_request		*first_fused_req;
 

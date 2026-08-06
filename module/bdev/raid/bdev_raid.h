@@ -116,6 +116,10 @@ struct raid_bdev_io {
 	uint8_t				base_bdev_io_status;
 
 	uint64_t timestamp;
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	uint64_t latency_breakdown_request_id;
+	uint64_t latency_breakdown_start_ticks;
+#endif
 };
 
 /*
@@ -239,12 +243,20 @@ struct raid_bdev_io_channel {
 
 	/* Number of IO channels */
 	uint8_t			num_channels;
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	uint64_t		latency_breakdown_target_sequence[256];
+#endif
 };
 
 struct iov_wrapper {
     struct iovec iovs[16];
     uint64_t num_blocks;
     struct raid_bdev_io *raid_io;
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+    uint64_t latency_breakdown_correlation_id;
+    uint64_t latency_breakdown_submit_ticks;
+    uint32_t latency_breakdown_target_id;
+#endif
 
     TAILQ_ENTRY(iov_wrapper) link;
 };

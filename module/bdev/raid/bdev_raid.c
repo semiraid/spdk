@@ -37,6 +37,9 @@
 #include "spdk/log.h"
 #include "spdk/string.h"
 #include "spdk/util.h"
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+#include "semiraid_latency_breakdown.h"
+#endif
 #include "spdk/json.h"
 #include "spdk/string.h"
 
@@ -124,6 +127,11 @@ raid_bdev_create_cb(void *io_device, void *ctx_buf)
 	assert(raid_bdev->state == RAID_BDEV_STATE_ONLINE);
 
 	raid_ch->num_channels = raid_bdev->num_base_bdevs;
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	memset(raid_ch->latency_breakdown_target_sequence,
+	       0,
+	       sizeof(raid_ch->latency_breakdown_target_sequence));
+#endif
 
 	raid_ch->base_channel = calloc(raid_ch->num_channels,
 				       sizeof(struct spdk_io_channel *));
@@ -327,6 +335,16 @@ raid_bdev_io_complete(struct raid_bdev_io *raid_io, enum spdk_bdev_io_status sta
 {
 	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(raid_io);
 
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	semiraid_lb_emit_request(
+		raid_io->latency_breakdown_request_id,
+		bdev_io->type == SPDK_BDEV_IO_TYPE_READ ? SEMIRAID_LB_OP_READ : SEMIRAID_LB_OP_WRITE,
+		status == SPDK_BDEV_IO_STATUS_SUCCESS ? SEMIRAID_LB_FLAG_SUCCESS : 0,
+		raid_io->latency_breakdown_start_ticks,
+		spdk_get_ticks(),
+		SEMIRAID_LB_BG_WAIT_NONE,
+		0);
+#endif
 	spdk_bdev_io_complete(bdev_io, status);
 }
 
@@ -502,6 +520,18 @@ raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 	raid_io->base_bdev_io_remaining = 0;
 	raid_io->base_bdev_io_submitted = 0;
 	raid_io->base_bdev_io_status = SPDK_BDEV_IO_STATUS_SUCCESS;
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	static __thread uint64_t latency_breakdown_sequence;
+	static __thread bool latency_breakdown_clock_configured;
+	if (!latency_breakdown_clock_configured) {
+		latency_breakdown_clock_configured =
+			semiraid_lb_recorder_configure_ticks(spdk_get_ticks_hz()) == 0;
+	}
+	uint64_t core = (uint64_t)spdk_env_get_current_core() & 0xffu;
+	raid_io->latency_breakdown_request_id =
+		(core << 56u) | (++latency_breakdown_sequence & UINT64_C(0x00ffffffffffffff));
+	raid_io->latency_breakdown_start_ticks = spdk_get_ticks();
+#endif
 
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:

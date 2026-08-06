@@ -39,6 +39,10 @@ APP = spdk_tgt
 
 C_SRCS := spdk_tgt.c
 
+ifeq ($(CONFIG_SEMIRAID_LATENCY_BREAKDOWN),y)
+C_SRCS += semiraid_latency_breakdown_recorder.c
+endif
+
 SPDK_LIB_LIST = $(ALL_MODULES_LIST)
 
 SPDK_LIB_LIST += event event_iscsi event_nvmf
