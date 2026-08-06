@@ -769,6 +769,11 @@ struct spdk_bdev_io {
 
 		/** Pointer to a structure passed by the user in ext API */
 		struct spdk_bdev_ext_io_opts *ext_opts;
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+
+		/** Evaluation-only command correlation inherited at bdev I/O allocation. */
+		uint64_t latency_breakdown_correlation_id;
+#endif
 	} internal;
 
 	/**

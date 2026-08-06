@@ -1651,6 +1651,10 @@ bdev_nvme_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io,
 		goto exit;
 	}
 
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	uint64_t previous_correlation = spdk_nvme_breakdown_set_current_correlation(
+		spdk_bdev_breakdown_get_io_correlation(bdev_io));
+#endif
 	ret = bdev_nvme_readv(bio,
 			      bdev_io->u.bdev.iovs,
 			      bdev_io->u.bdev.iovcnt,
@@ -1659,6 +1663,9 @@ bdev_nvme_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io,
 			      bdev_io->u.bdev.offset_blocks,
 			      bdev->dif_check_flags,
 			      bdev_io->internal.ext_opts);
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	spdk_nvme_breakdown_set_current_correlation(previous_correlation);
+#endif
 
 exit:
 	if (spdk_unlikely(ret != 0)) {
@@ -1674,6 +1681,10 @@ bdev_nvme_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 	struct nvme_bdev_io *nbdev_io = (struct nvme_bdev_io *)bdev_io->driver_ctx;
 	struct nvme_bdev_io *nbdev_io_to_abort;
 	int rc = 0;
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	uint64_t previous_correlation = spdk_nvme_breakdown_set_current_correlation(
+		spdk_bdev_breakdown_get_io_correlation(bdev_io));
+#endif
 
 	nbdev_io->io_path = bdev_nvme_find_io_path(nbdev_ch);
 	if (spdk_unlikely(!nbdev_io->io_path)) {
@@ -1808,6 +1819,9 @@ bdev_nvme_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 	}
 
 exit:
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	spdk_nvme_breakdown_set_current_correlation(previous_correlation);
+#endif
 	if (spdk_unlikely(rc != 0)) {
 		bdev_nvme_io_complete(nbdev_io, rc);
 	}

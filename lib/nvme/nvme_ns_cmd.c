@@ -34,6 +34,19 @@
  */
 
 #include "nvme_internal.h"
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+#include "semiraid_latency_breakdown.h"
+
+static __thread uint64_t g_nvme_breakdown_current_correlation;
+
+uint64_t
+spdk_nvme_breakdown_set_current_correlation(uint64_t correlation_id)
+{
+	uint64_t previous = g_nvme_breakdown_current_correlation;
+	g_nvme_breakdown_current_correlation = correlation_id;
+	return previous;
+}
+#endif
 
 static inline struct nvme_request *_nvme_ns_cmd_rw(struct spdk_nvme_ns *ns,
 		struct spdk_nvme_qpair *qpair,
@@ -179,6 +192,12 @@ _nvme_ns_cmd_setup_request(struct spdk_nvme_ns *ns, struct nvme_request *req,
 	cmd = &req->cmd;
 	cmd->opc = opc;
 	cmd->nsid = ns->id;
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	if (semiraid_lb_command_id_valid(g_nvme_breakdown_current_correlation)) {
+		cmd->rsvd2 = (uint32_t)g_nvme_breakdown_current_correlation;
+		cmd->rsvd3 = (uint32_t)(g_nvme_breakdown_current_correlation >> 32u);
+	}
+#endif
 
 	*(uint64_t *)&cmd->cdw10 = lba;
 

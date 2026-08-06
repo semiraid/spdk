@@ -63,6 +63,11 @@ extern "C" {
  */
 struct spdk_nvme_ctrlr;
 
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+/* Evaluation-only TLS sideband copied into NVMe command dwords 2-3. */
+uint64_t spdk_nvme_breakdown_set_current_correlation(uint64_t correlation_id);
+#endif
+
 /**
  * NVMe controller initialization options.
  *

@@ -78,6 +78,25 @@ int __itt_init_ittlib(const char *, __itt_group_id);
 
 #define SPDK_BDEV_POOL_ALIGNMENT 512
 
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+static __thread uint64_t g_latency_breakdown_correlation_id;
+
+uint64_t
+spdk_bdev_breakdown_set_current_correlation(uint64_t correlation_id)
+{
+	uint64_t previous = g_latency_breakdown_correlation_id;
+
+	g_latency_breakdown_correlation_id = correlation_id;
+	return previous;
+}
+
+uint64_t
+spdk_bdev_breakdown_get_io_correlation(const struct spdk_bdev_io *bdev_io)
+{
+	return bdev_io->internal.latency_breakdown_correlation_id;
+}
+#endif
+
 /* The maximum number of children requests for a UNMAP or WRITE ZEROES command
  * when splitting into children requests at a time.
  */
@@ -2670,6 +2689,10 @@ bdev_io_init(struct spdk_bdev_io *bdev_io,
 	bdev_io->internal.get_buf_cb = NULL;
 	bdev_io->internal.get_aux_buf_cb = NULL;
 	bdev_io->internal.ext_opts = NULL;
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	bdev_io->internal.latency_breakdown_correlation_id =
+		g_latency_breakdown_correlation_id;
+#endif
 }
 
 static bool

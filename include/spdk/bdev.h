@@ -105,6 +105,19 @@ typedef void (*spdk_bdev_event_cb_t)(enum spdk_bdev_event_type type, struct spdk
  */
 struct spdk_bdev_io;
 
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+/**
+ * Set the command correlation inherited by bdev I/Os allocated on this thread.
+ *
+ * This evaluation-only sideband is deliberately excluded from normal builds.
+ * The previous value is returned so callers can restore nested submission state.
+ */
+uint64_t spdk_bdev_breakdown_set_current_correlation(uint64_t correlation_id);
+
+/** Return the evaluation-only command correlation carried by a bdev I/O. */
+uint64_t spdk_bdev_breakdown_get_io_correlation(const struct spdk_bdev_io *bdev_io);
+#endif
+
 struct spdk_bdev_fn_table;
 struct spdk_io_channel;
 struct spdk_json_write_ctx;

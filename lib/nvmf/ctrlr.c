@@ -4013,6 +4013,9 @@ _nvmf_request_complete(void *ctx)
 			SEMIRAID_LB_BG_WAIT_NONE,
 			0);
 		req->latency_breakdown_correlation_id = 0;
+		req->latency_breakdown_receive_ticks = 0;
+		req->latency_breakdown_ssd_submit_ticks = 0;
+		req->latency_breakdown_operation = 0;
 	}
 #endif
 	if (nvmf_transport_req_complete(req)) {
@@ -4186,23 +4189,27 @@ spdk_nvmf_request_exec(struct spdk_nvmf_request *req)
 	enum spdk_nvmf_request_exec_status status;
 
 #if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
-	if (req->latency_breakdown_receive_ticks == 0 &&
+	if (req->latency_breakdown_correlation_id == 0 &&
 	    !nvmf_qpair_is_admin_queue(qpair) &&
 	    (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ ||
 	     req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_WRITE)) {
 		static __thread bool latency_breakdown_clock_configured;
+		const uint64_t correlation_id =
+			(uint64_t)req->cmd->nvme_cmd.rsvd2 |
+			((uint64_t)req->cmd->nvme_cmd.rsvd3 << 32u);
 
-		if (!latency_breakdown_clock_configured) {
-			latency_breakdown_clock_configured =
-				semiraid_lb_recorder_configure_ticks(spdk_get_ticks_hz()) == 0;
+		if (semiraid_lb_command_id_valid(correlation_id)) {
+			if (!latency_breakdown_clock_configured) {
+				latency_breakdown_clock_configured =
+					semiraid_lb_recorder_configure_ticks(spdk_get_ticks_hz()) == 0;
+			}
+			req->latency_breakdown_correlation_id = correlation_id;
+			req->latency_breakdown_receive_ticks = spdk_get_ticks();
+			req->latency_breakdown_ssd_submit_ticks = 0;
+			req->latency_breakdown_operation =
+				req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ ?
+				SEMIRAID_LB_OP_READ : SEMIRAID_LB_OP_WRITE;
 		}
-		req->latency_breakdown_correlation_id =
-			++qpair->latency_breakdown_sequence;
-		req->latency_breakdown_receive_ticks = spdk_get_ticks();
-		req->latency_breakdown_ssd_submit_ticks = 0;
-		req->latency_breakdown_operation =
-			req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ ?
-			SEMIRAID_LB_OP_READ : SEMIRAID_LB_OP_WRITE;
 	}
 #endif
 

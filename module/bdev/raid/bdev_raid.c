@@ -520,18 +520,23 @@ raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 	raid_io->base_bdev_io_remaining = 0;
 	raid_io->base_bdev_io_submitted = 0;
 	raid_io->base_bdev_io_status = SPDK_BDEV_IO_STATUS_SUCCESS;
-#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
 	static __thread uint64_t latency_breakdown_sequence;
 	static __thread bool latency_breakdown_clock_configured;
-	if (!latency_breakdown_clock_configured) {
+	if (semiraid_lb_measurement_active() && !latency_breakdown_clock_configured) {
 		latency_breakdown_clock_configured =
 			semiraid_lb_recorder_configure_ticks(spdk_get_ticks_hz()) == 0;
 	}
-	uint64_t core = (uint64_t)spdk_env_get_current_core() & 0xffu;
-	raid_io->latency_breakdown_request_id =
-		(core << 56u) | (++latency_breakdown_sequence & UINT64_C(0x00ffffffffffffff));
-	raid_io->latency_breakdown_start_ticks = spdk_get_ticks();
-#endif
+	if (semiraid_lb_measurement_active()) {
+		uint64_t core = (uint64_t)spdk_env_get_current_core() & 0xffu;
+		raid_io->latency_breakdown_request_id =
+			(core << 56u) | (++latency_breakdown_sequence & UINT64_C(0x00ffffffffffffff));
+		raid_io->latency_breakdown_start_ticks = spdk_get_ticks();
+	} else {
+		raid_io->latency_breakdown_request_id = 0;
+		raid_io->latency_breakdown_start_ticks = 0;
+	}
+	#endif
 
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
