@@ -48,6 +48,9 @@
 #include "nvmf_internal.h"
 
 #include "spdk_internal/trace_defs.h"
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+#include "semiraid_latency_breakdown.h"
+#endif
 
 struct spdk_nvme_rdma_hooks g_nvmf_hooks = {};
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_rdma;
@@ -2040,6 +2043,10 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 			}
 
 			rdma_req->state = RDMA_REQUEST_STATE_EXECUTING;
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+			rdma_req->req.latency_breakdown_provider_ready_ticks =
+				rdma_req->receive_tsc;
+#endif
 			spdk_nvmf_request_exec(&rdma_req->req);
 			break;
 		case RDMA_REQUEST_STATE_EXECUTING:
@@ -3723,6 +3730,52 @@ _qp_reset_failed_sends(struct spdk_nvmf_rdma_transport *rtransport,
 
 }
 
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+static void
+nvmf_rdma_latency_breakdown_note_response_posts(struct ibv_send_wr *first,
+						 uint64_t post_ticks)
+{
+	struct ibv_send_wr *wr;
+
+	for (wr = first; wr != NULL; wr = wr->next) {
+		struct spdk_nvmf_rdma_wr *rdma_wr = (void *)wr->wr_id;
+		struct spdk_nvmf_rdma_request *rdma_req;
+		struct spdk_nvmf_request *req;
+
+		if (rdma_wr == NULL || rdma_wr->type != RDMA_WR_TYPE_SEND) {
+			continue;
+		}
+		rdma_req = SPDK_CONTAINEROF(rdma_wr, struct spdk_nvmf_rdma_request,
+					    rsp.rdma_wr);
+		req = &rdma_req->req;
+		if (req->latency_breakdown_correlation_id == 0 ||
+		    req->latency_breakdown_provider_ready_ticks == 0 ||
+		    req->latency_breakdown_handler_entry_ticks == 0 ||
+		    req->latency_breakdown_response_ready_ticks == 0) {
+			continue;
+		}
+		semiraid_lb_emit_target_command_timeline(
+			req->latency_breakdown_correlation_id,
+			req->latency_breakdown_correlation_id,
+			semiraid_lb_target_id(),
+			req->latency_breakdown_success ? SEMIRAID_LB_FLAG_SUCCESS : 0,
+			req->latency_breakdown_operation,
+			req->latency_breakdown_provider_ready_ticks,
+			req->latency_breakdown_handler_entry_ticks,
+			req->latency_breakdown_response_ready_ticks,
+			post_ticks,
+			spdk_env_get_current_core());
+		req->latency_breakdown_correlation_id = 0;
+		req->latency_breakdown_provider_ready_ticks = 0;
+		req->latency_breakdown_handler_entry_ticks = 0;
+		req->latency_breakdown_response_ready_ticks = 0;
+		req->latency_breakdown_ssd_submit_ticks = 0;
+		req->latency_breakdown_operation = 0;
+		req->latency_breakdown_success = 0;
+	}
+}
+#endif
+
 static void
 _poller_submit_sends(struct spdk_nvmf_rdma_transport *rtransport,
 		     struct spdk_nvmf_rdma_poller *rpoller)
@@ -3733,12 +3786,23 @@ _poller_submit_sends(struct spdk_nvmf_rdma_transport *rtransport,
 
 	while (!STAILQ_EMPTY(&rpoller->qpairs_pending_send)) {
 		rqpair = STAILQ_FIRST(&rpoller->qpairs_pending_send);
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+		struct ibv_send_wr *latency_breakdown_first =
+			rqpair->rdma_qp->send_wrs.first;
+		const uint64_t latency_breakdown_post_ticks = spdk_get_ticks();
+#endif
 		rc = spdk_rdma_qp_flush_send_wrs(rqpair->rdma_qp, &bad_wr);
 
 		/* bad wr always points to the first wr that failed. */
 		if (rc) {
 			_qp_reset_failed_sends(rtransport, rqpair, bad_wr, rc);
 		}
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+		else {
+			nvmf_rdma_latency_breakdown_note_response_posts(
+				latency_breakdown_first, latency_breakdown_post_ticks);
+		}
+#endif
 		STAILQ_REMOVE_HEAD(&rpoller->qpairs_pending_send, send_link);
 	}
 }
@@ -3801,6 +3865,15 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 	} else if (reaped == 0) {
 		rpoller->stat.idle_polls++;
 	}
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	/*
+	 * A completion returned by ibv_poll_cq() may have arrived after the
+	 * pre-poll timestamp.  Use the return boundary as the first point at
+	 * which every CQE in this batch is known to be software-visible; this
+	 * keeps the Target interval causally inside the Host command interval.
+	 */
+	const uint64_t latency_breakdown_provider_ready_tsc = spdk_get_ticks();
+#endif
 
 	rpoller->stat.polls++;
 	rpoller->stat.completions += reaped;
@@ -3862,7 +3935,12 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 
 			rdma_recv->wr.next = NULL;
 			rqpair->current_recv_depth++;
-			rdma_recv->receive_tsc = poll_tsc;
+			rdma_recv->receive_tsc =
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+				latency_breakdown_provider_ready_tsc;
+#else
+				poll_tsc;
+#endif
 			rpoller->stat.requests++;
 			STAILQ_INSERT_TAIL(&rqpair->resources->incoming_queue, rdma_recv, link);
 			break;

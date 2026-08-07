@@ -3919,9 +3919,12 @@ spdk_nvmf_request_free(struct spdk_nvmf_request *req)
 	TAILQ_REMOVE(&qpair->outstanding, req, link);
 #if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
 	req->latency_breakdown_correlation_id = 0;
-	req->latency_breakdown_receive_ticks = 0;
+	req->latency_breakdown_provider_ready_ticks = 0;
+	req->latency_breakdown_handler_entry_ticks = 0;
+	req->latency_breakdown_response_ready_ticks = 0;
 	req->latency_breakdown_ssd_submit_ticks = 0;
 	req->latency_breakdown_operation = 0;
+	req->latency_breakdown_success = 0;
 #endif
 	if (nvmf_transport_req_free(req)) {
 		SPDK_ERRLOG("Unable to free transport level request resources.\n");
@@ -4003,19 +4006,8 @@ _nvmf_request_complete(void *ctx)
 	if (req->latency_breakdown_correlation_id != 0 &&
 	    (req->zcopy_phase == NVMF_ZCOPY_PHASE_NONE ||
 	     req->zcopy_phase == NVMF_ZCOPY_PHASE_COMPLETE)) {
-		semiraid_lb_emit_target_command(
-			req->latency_breakdown_correlation_id,
-			semiraid_lb_target_id(),
-			spdk_nvme_cpl_is_error(rsp) ? 0 : SEMIRAID_LB_FLAG_SUCCESS,
-			req->latency_breakdown_operation,
-			req->latency_breakdown_receive_ticks,
-			spdk_get_ticks(),
-			SEMIRAID_LB_BG_WAIT_NONE,
-			0);
-		req->latency_breakdown_correlation_id = 0;
-		req->latency_breakdown_receive_ticks = 0;
-		req->latency_breakdown_ssd_submit_ticks = 0;
-		req->latency_breakdown_operation = 0;
+		req->latency_breakdown_response_ready_ticks = spdk_get_ticks();
+		req->latency_breakdown_success = !spdk_nvme_cpl_is_error(rsp);
 	}
 #endif
 	if (nvmf_transport_req_complete(req)) {
@@ -4204,11 +4196,17 @@ spdk_nvmf_request_exec(struct spdk_nvmf_request *req)
 					semiraid_lb_recorder_configure_ticks(spdk_get_ticks_hz()) == 0;
 			}
 			req->latency_breakdown_correlation_id = correlation_id;
-			req->latency_breakdown_receive_ticks = spdk_get_ticks();
+			req->latency_breakdown_handler_entry_ticks = spdk_get_ticks();
+			if (req->latency_breakdown_provider_ready_ticks == 0) {
+				req->latency_breakdown_provider_ready_ticks =
+					req->latency_breakdown_handler_entry_ticks;
+			}
+			req->latency_breakdown_response_ready_ticks = 0;
 			req->latency_breakdown_ssd_submit_ticks = 0;
 			req->latency_breakdown_operation =
 				req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ ?
 				SEMIRAID_LB_OP_READ : SEMIRAID_LB_OP_WRITE;
+			req->latency_breakdown_success = 0;
 		}
 	}
 #endif

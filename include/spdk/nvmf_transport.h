@@ -120,9 +120,12 @@ struct spdk_nvmf_request {
 	enum spdk_nvmf_zcopy_phase	zcopy_phase;
 #if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
 	uint64_t			latency_breakdown_correlation_id;
-	uint64_t			latency_breakdown_receive_ticks;
+	uint64_t			latency_breakdown_provider_ready_ticks;
+	uint64_t			latency_breakdown_handler_entry_ticks;
+	uint64_t			latency_breakdown_response_ready_ticks;
 	uint64_t			latency_breakdown_ssd_submit_ticks;
 	uint8_t			latency_breakdown_operation;
+	uint8_t			latency_breakdown_success;
 #endif
 
 	TAILQ_ENTRY(spdk_nvmf_request)	link;
