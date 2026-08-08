@@ -124,8 +124,10 @@ struct spdk_nvmf_request {
 	uint64_t			latency_breakdown_handler_entry_ticks;
 	uint64_t			latency_breakdown_response_ready_ticks;
 	uint64_t			latency_breakdown_ssd_submit_ticks;
+	uint32_t			latency_breakdown_pending_core;
 	uint8_t			latency_breakdown_operation;
 	uint8_t			latency_breakdown_success;
+	uint8_t			latency_breakdown_pending_active;
 #endif
 
 	TAILQ_ENTRY(spdk_nvmf_request)	link;

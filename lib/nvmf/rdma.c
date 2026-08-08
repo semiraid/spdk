@@ -3731,6 +3731,18 @@ _qp_reset_failed_sends(struct spdk_nvmf_rdma_transport *rtransport,
 }
 
 #if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+static inline void
+nvmf_rdma_latency_breakdown_end_pending(struct spdk_nvmf_request *req)
+{
+	if (req->latency_breakdown_pending_active) {
+		semiraid_lb_reactor_foreground_pending_end(
+			req->latency_breakdown_pending_core);
+		req->latency_breakdown_pending_active = 0;
+		req->latency_breakdown_pending_core =
+			SEMIRAID_LB_REACTOR_CORE_UNKNOWN;
+	}
+}
+
 static void
 nvmf_rdma_latency_breakdown_note_response_posts(struct ibv_send_wr *first,
 						 uint64_t post_ticks)
@@ -3752,6 +3764,7 @@ nvmf_rdma_latency_breakdown_note_response_posts(struct ibv_send_wr *first,
 		    req->latency_breakdown_provider_ready_ticks == 0 ||
 		    req->latency_breakdown_handler_entry_ticks == 0 ||
 		    req->latency_breakdown_response_ready_ticks == 0) {
+			nvmf_rdma_latency_breakdown_end_pending(req);
 			continue;
 		}
 		semiraid_lb_emit_target_command_timeline(
@@ -3770,6 +3783,7 @@ nvmf_rdma_latency_breakdown_note_response_posts(struct ibv_send_wr *first,
 		req->latency_breakdown_handler_entry_ticks = 0;
 		req->latency_breakdown_response_ready_ticks = 0;
 		req->latency_breakdown_ssd_submit_ticks = 0;
+		nvmf_rdma_latency_breakdown_end_pending(req);
 		req->latency_breakdown_operation = 0;
 		req->latency_breakdown_success = 0;
 	}

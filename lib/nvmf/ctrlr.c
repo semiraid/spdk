@@ -3918,13 +3918,19 @@ spdk_nvmf_request_free(struct spdk_nvmf_request *req)
 
 	TAILQ_REMOVE(&qpair->outstanding, req, link);
 #if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	if (req->latency_breakdown_pending_active) {
+		semiraid_lb_reactor_foreground_pending_end(
+			req->latency_breakdown_pending_core);
+	}
 	req->latency_breakdown_correlation_id = 0;
 	req->latency_breakdown_provider_ready_ticks = 0;
 	req->latency_breakdown_handler_entry_ticks = 0;
 	req->latency_breakdown_response_ready_ticks = 0;
 	req->latency_breakdown_ssd_submit_ticks = 0;
+	req->latency_breakdown_pending_core = SEMIRAID_LB_REACTOR_CORE_UNKNOWN;
 	req->latency_breakdown_operation = 0;
 	req->latency_breakdown_success = 0;
+	req->latency_breakdown_pending_active = 0;
 #endif
 	if (nvmf_transport_req_free(req)) {
 		SPDK_ERRLOG("Unable to free transport level request resources.\n");
@@ -4008,6 +4014,12 @@ _nvmf_request_complete(void *ctx)
 	     req->zcopy_phase == NVMF_ZCOPY_PHASE_COMPLETE)) {
 		req->latency_breakdown_response_ready_ticks = spdk_get_ticks();
 		req->latency_breakdown_success = !spdk_nvme_cpl_is_error(rsp);
+		if (!req->latency_breakdown_pending_active) {
+			req->latency_breakdown_pending_core = spdk_env_get_current_core();
+			semiraid_lb_reactor_foreground_pending_begin(
+				req->latency_breakdown_pending_core);
+			req->latency_breakdown_pending_active = 1;
+		}
 	}
 #endif
 	if (nvmf_transport_req_complete(req)) {
@@ -4203,10 +4215,13 @@ spdk_nvmf_request_exec(struct spdk_nvmf_request *req)
 			}
 			req->latency_breakdown_response_ready_ticks = 0;
 			req->latency_breakdown_ssd_submit_ticks = 0;
+			req->latency_breakdown_pending_core =
+				SEMIRAID_LB_REACTOR_CORE_UNKNOWN;
 			req->latency_breakdown_operation =
 				req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ ?
 				SEMIRAID_LB_OP_READ : SEMIRAID_LB_OP_WRITE;
 			req->latency_breakdown_success = 0;
+			req->latency_breakdown_pending_active = 0;
 		}
 	}
 #endif
